@@ -30,7 +30,7 @@ def rerun_attendance_for_period(from_date=None, to_date=None, location=None):
 	"""
 	from_date = getdate(from_date or "2026-09-02")
 	to_date = getdate(to_date or "2026-09-06")
-	filters = {"status": "Active","name":"EMP/01019"}
+	filters = {"status": "Active"}
 	if location:
 		filters["location"] = location
 
@@ -390,7 +390,8 @@ def rerun_employee_attendance(employee, location, date, no_check_in=0, staff_typ
 
 	# Determine attendance status based on rules
 	status, late_entry, early_exit, extra_late_entry, extra_early_exit, remarks = determine_status(
-		checkin_time, checkout_time, location_rules, employee, date
+		checkin_time, checkout_time, location_rules, employee, date,
+		checkin_out_of_location, checkout_out_of_location
 	)
 
 	working_hours = 0

@@ -293,7 +293,8 @@ def process_employee_attendance(employee, location, date, no_check_in=0, staff_t
 
 	# Determine attendance status based on rules
 	status, late_entry, early_exit, extra_late_entry, extra_early_exit, remarks = determine_status(
-		checkin_time, checkout_time, location_rules, employee, date
+		checkin_time, checkout_time, location_rules, employee, date,
+		checkin_out_of_location, checkout_out_of_location
 	)
 
 	# Non-Worker employees do not need working hours
@@ -367,7 +368,8 @@ def _process_field_attendance(employee, date):
 		return "Absent"
 
 
-def determine_status(checkin_time, checkout_time, location_rules, employee, date):
+def determine_status(checkin_time, checkout_time, location_rules, employee, date,
+	checkin_out_of_location=False, checkout_out_of_location=False):
 	"""
 	Determine attendance status based on checkin/checkout times and ESS Location rules.
 	Used for non-Worker employees only.
@@ -386,6 +388,12 @@ def determine_status(checkin_time, checkout_time, location_rules, employee, date
 
 	The monthly count rule (late_count_for_half_day / _full_day /
 	treat_late_as_half_day_after) is NOT applied here — it is handled in payroll.
+
+	An approved out-of-location punch (checkin_out_of_location /
+	checkout_out_of_location) carries a substituted shift time, not a real one,
+	so it is never flagged late / early. Without this, a short-leave day lands
+	the substituted time exactly on the shifted half-day cut-off (e.g. Second
+	Half: checkout 16:00 <= cut-off 16:00) and is wrongly flagged extra early.
 
 	Returns: (status, late_entry, early_exit, extra_late_entry, extra_early_exit, remarks)
 	"""
@@ -459,7 +467,7 @@ def determine_status(checkin_time, checkout_time, location_rules, employee, date
 		# Instead of marking the day Half Day, we flag it as extra late / early.
 		#   check-in  at/after  half_day_arrival_time    -> extra_late_entry
 		#   check-out at/before half_day_departure_time  -> extra_early_exit
-		if checkin_time and half_day_arrival:
+		if checkin_time and half_day_arrival and not checkin_out_of_location:
 			checkin_only_time = get_datetime(checkin_time).time()
 			if checkin_only_time >= half_day_arrival:
 				extra_late_entry = True
@@ -469,7 +477,7 @@ def determine_status(checkin_time, checkout_time, location_rules, employee, date
 					)
 				)
 
-		if checkout_time and half_day_departure:
+		if checkout_time and half_day_departure and not checkout_out_of_location:
 			checkout_only_time = get_datetime(checkout_time).time()
 			if checkout_only_time <= half_day_departure:
 				extra_early_exit = True
@@ -484,7 +492,7 @@ def determine_status(checkin_time, checkout_time, location_rules, employee, date
 		#   check-out before early_exit_threshold    -> early_exit
 		# If the day already qualifies as extra late / early (crossed the half-day
 		# threshold), the regular flag is NOT set — extra replaces it.
-		if checkin_time and late_threshold and not extra_late_entry:
+		if checkin_time and late_threshold and not extra_late_entry and not checkin_out_of_location:
 			checkin_only_time = get_datetime(checkin_time).time()
 			if checkin_only_time > late_threshold:
 				late_entry = True
@@ -494,7 +502,7 @@ def determine_status(checkin_time, checkout_time, location_rules, employee, date
 					)
 				)
 
-		if checkout_time and early_exit_threshold and not extra_early_exit:
+		if checkout_time and early_exit_threshold and not extra_early_exit and not checkout_out_of_location:
 			checkout_only_time = get_datetime(checkout_time).time()
 			if checkout_only_time < early_exit_threshold:
 				early_exit = True
