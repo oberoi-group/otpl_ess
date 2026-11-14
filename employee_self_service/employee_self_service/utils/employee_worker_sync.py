@@ -64,6 +64,10 @@ def _update_single_worker_from_manager(doc):
 		external_manager_details = frappe.get_doc("Employee Pull", reporting_manager)
 		
 		if not external_manager_details.get("sales_order"):
+			# Travelling employees may report to a manager without an order;
+			# keep the employee's existing order instead of blocking check-in.
+			if _is_travelling_today(doc):
+				return
 			frappe.throw(_("External reporting manager {0} does not have Sales Order defined. Please contact administrator.").format(reporting_manager))
 		doc.external_order = external_manager_details.get("sales_order") + "-" + external_manager_details.get("company")
 		if frappe.db.exists("Sales Order Pull", doc.external_order):
@@ -105,6 +109,13 @@ def _update_single_worker_from_manager(doc):
 	if not manager_data:
 		frappe.throw(_("Could not fetch manager data for Employee: {0}").format(reporting_manager))
 
+	if (
+		not manager_data.get("sales_order")
+		and not manager_data.get("external_order")
+		and _is_travelling_today(doc)
+	):
+		return
+
 	# Check if manager has external sales order
 	if manager_data.get("external_sales_order") == 1:
 		doc.external_sales_order = 1
@@ -120,6 +131,15 @@ def _update_single_worker_from_manager(doc):
 		doc.external_order = None
 		doc.external_business_vertical = None
 		doc.external_so = None
+
+
+def _is_travelling_today(doc):
+	"""True if the employee has an Approved Travel Request covering today."""
+	from employee_self_service.employee_self_service.doctype.travel_request.travel_request import (
+		is_employee_travelling,
+	)
+
+	return bool(doc.name and is_employee_travelling(doc.name))
 
 
 def _clear_worker_fields(doc):
