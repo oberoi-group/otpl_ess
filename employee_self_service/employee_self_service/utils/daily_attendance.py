@@ -4,7 +4,7 @@
 
 from __future__ import unicode_literals
 import frappe
-from frappe.utils import getdate, get_datetime, add_days, get_first_day, time_diff_in_hours
+from frappe.utils import getdate, get_datetime, add_days, get_first_day, time_diff_in_hours, cint
 from datetime import datetime, timedelta
 
 
@@ -22,11 +22,11 @@ def process_daily_attendance():
 	"""
 	yesterday = add_days(getdate(), -1)
 
-	employees = frappe.get_all("Employee",
-		filters={"status": "Active"},
-		fields=["name", "employee_name", "location", "company", "no_check_in", "staff_type","from_hours","to_hours",
-			"late_arrival_threshold", "early_exit_threshold", "half_day_arrival_time", "half_day_departure_time"]
-	)
+	fields = ["name", "employee_name", "location", "company", "no_check_in", "staff_type","from_hours","to_hours",
+		"late_arrival_threshold", "early_exit_threshold", "half_day_arrival_time", "half_day_departure_time"]
+	if frappe.db.has_column("Employee", "forced_leave"):
+		fields.append("forced_leave")
+	employees = frappe.get_all("Employee", filters={"status": "Active"}, fields=fields)
 
 	processed_count = 0
 	skipped_count = 0
@@ -39,7 +39,8 @@ def process_daily_attendance():
 				emp.name, emp.location, yesterday,
 				emp.get("no_check_in", 0), emp.get("staff_type"), emp.get("from_hours"), emp.get("to_hours"),
 				emp.get("late_arrival_threshold"), emp.get("early_exit_threshold"),
-				emp.get("half_day_arrival_time"), emp.get("half_day_departure_time")
+				emp.get("half_day_arrival_time"), emp.get("half_day_departure_time"),
+				forced_leave=emp.get("forced_leave", 0)
 			)
 
 			if result == "Processed":
@@ -83,13 +84,16 @@ def process_daily_attendance():
 
 
 def process_employee_attendance(employee, location, date, no_check_in=0, staff_type=None, from_hours=None, to_hours=None,
-	emp_late_arrival_threshold=None, emp_early_exit_threshold=None, emp_half_day_arrival_time=None, emp_half_day_departure_time=None):
+	emp_late_arrival_threshold=None, emp_early_exit_threshold=None, emp_half_day_arrival_time=None, emp_half_day_departure_time=None,
+	forced_leave=0):
 	"""
 	Process attendance for a single employee.
 	Returns: Processed, Skipped, Absent, or Error
 
 	Routing:
 	- Attendance or leave application already exists → Skipped
+	- Employee on Forced Leave with no check-in → Present (flagged Forced Leave),
+	  holidays skipped; with a check-in the day is processed normally
 	- Worker employees → delegated to run_worker_attendance
 	- no_check_in employees → auto Present
 	- Non-Worker on holiday → Skipped
@@ -137,6 +141,13 @@ def process_employee_attendance(employee, location, date, no_check_in=0, staff_t
 	if existing_leave:
 		# Leave application exists for this day, skip
 		return "Skipped"
+
+	# --- Forced Leave: sent home by the company, paid as salary (no TA/DA) ---
+	if cint(forced_leave):
+		result = _process_forced_leave(employee, date)
+		if result:
+			return result
+		# A check-in on the day means they worked: process it as usual below.
 
 	# --- Worker employees: delegate to run_worker_attendance ---
 	if staff_type == "Worker":
@@ -557,8 +568,52 @@ def get_month_late_count(employee, date):
 		return 0
 
 
-def create_attendance_record(employee, date, status, late_entry, early_exit, working_hours, remarks, checkin_time=None, checkout_time=None, extra_late_entry=False, extra_early_exit=False):
-	"""Create and submit attendance record"""
+def is_holiday_for_employee(employee, date):
+	"""Holiday per the employee's own Holiday List, else the company default -
+	the same rule OTPL Payroll uses, so a skipped day is a holiday there too."""
+	holiday_list = frappe.db.get_value("Employee", employee, "holiday_list")
+	if not holiday_list:
+		company = (frappe.db.get_value("Employee", employee, "company")
+		           or frappe.db.get_single_value("Global Defaults", "default_company"))
+		holiday_list = frappe.get_cached_value("Company", company, "default_holiday_list") if company else None
+	if not holiday_list:
+		return False
+	return bool(frappe.db.exists("Holiday", {"parent": holiday_list, "holiday_date": getdate(date)}))
+
+
+def _process_forced_leave(employee, date):
+	"""Mark a Forced Leave day for an employee the company sent home.
+
+	Returns "Skipped" on a holiday, "Processed" once the attendance is made, or
+	None when the employee checked in that day - they worked, so the caller
+	processes the day as usual. The attendance is Present (a paid day for
+	salary) with Attendance.forced_leave set, which OTPL Payroll uses to leave
+	the day out of TA/DA.
+	"""
+	if is_holiday_for_employee(employee, date):
+		return "Skipped"
+	checked_in = frappe.db.sql(
+		"""SELECT 1 FROM `tabEmployee Checkin`
+		   WHERE employee = %s AND DATE(time) = %s AND IFNULL(rejected, 0) = 0 LIMIT 1""",
+		(employee, getdate(date)))
+	if checked_in:
+		return None
+	create_attendance_record(
+		employee=employee,
+		date=date,
+		status="Present",
+		late_entry=False,
+		early_exit=False,
+		working_hours=0,
+		remarks="Forced Leave (auto): salary paid, no TA/DA",
+		extra={"forced_leave": 1},
+	)
+	return "Processed"
+
+
+def create_attendance_record(employee, date, status, late_entry, early_exit, working_hours, remarks, checkin_time=None, checkout_time=None, extra_late_entry=False, extra_early_exit=False, extra=None):
+	"""Create and submit attendance record. ``extra`` sets further fields
+	(e.g. forced_leave) when they exist on Attendance."""
 	try:
 		attendance = frappe.get_doc({
 			"doctype": "Attendance",
@@ -568,6 +623,9 @@ def create_attendance_record(employee, date, status, late_entry, early_exit, wor
 			"remarks": remarks,
 			"company": frappe.db.get_value("Global Defaults", "Global Defaults", "default_company") or "",
 		})
+		for field, value in (extra or {}).items():
+			if attendance.meta.has_field(field):
+				attendance.set(field, value)
 
 		# Set late_entry and early_exit if fields exist
 		if hasattr(attendance, 'late_entry'):

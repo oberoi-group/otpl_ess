@@ -791,6 +791,10 @@ def _fetch_attendance_aggregates(emp_ids, from_date, to_date):
 	extra_early_expr = "COALESCE(a.extra_early_exit, 0)" if has_extra_early else "0"
 	has_checkin_time = frappe.db.has_column("Attendance", "checkin_time")
 	checkin_time_expr = "a.checkin_time" if has_checkin_time else "NULL"
+	# Forced Leave (Present, flagged by the daily job for an employee sent
+	# home): paid as salary, but no TA/DA.
+	forced_leave_expr = ("COALESCE(a.forced_leave, 0)"
+	                     if frappe.db.has_column("Attendance", "forced_leave") else "0")
 
 	rows = frappe.db.sql(
 		"""
@@ -806,14 +810,15 @@ def _fetch_attendance_aggregates(emp_ids, from_date, to_date):
 			{working_hours_expr}              AS working_hours,
 			{checkin_time_expr}               AS checkin_time,
 			a.checkout_time                   AS checkout_time,
-			COALESCE(a.false_attendance, 0)   AS false_attendance
+			COALESCE(a.false_attendance, 0)   AS false_attendance,
+			{forced_leave_expr}               AS forced_leave
 		FROM `tabAttendance` a
 		WHERE a.employee IN %(emp_ids)s
 		  AND a.attendance_date BETWEEN %(from_date)s AND %(to_date)s
 		  AND a.docstatus = 1
 		""".format(late_mark_expr=late_mark_expr, working_hours_expr=working_hours_expr,
 		           extra_late_expr=extra_late_expr, extra_early_expr=extra_early_expr,
-		           checkin_time_expr=checkin_time_expr),
+		           checkin_time_expr=checkin_time_expr, forced_leave_expr=forced_leave_expr),
 		{"emp_ids": tuple(emp_ids), "from_date": from_date, "to_date": to_date},
 		as_dict=True,
 	)
@@ -821,6 +826,7 @@ def _fetch_attendance_aggregates(emp_ids, from_date, to_date):
 	out = defaultdict(lambda: {
 		"processed_dates": set(),
 		"present_dates": set(),
+		"forced_leave_dates": set(),   # subset of present_dates: salary, no TA/DA
 		"half_day_dates": set(),
 		"absent_dates": set(),
 		"absent_no_punch_dates": set(),
@@ -846,6 +852,8 @@ def _fetch_attendance_aggregates(emp_ids, from_date, to_date):
 			bucket["checkout_by_date"][d] = get_datetime(r.checkout_time)
 		if r.status == "Present":
 			bucket["present_dates"].add(d)
+			if cint(r.forced_leave):
+				bucket["forced_leave_dates"].add(d)
 		elif r.status == "Half Day":
 			bucket["half_day_dates"].add(d)
 		elif r.status == "Absent":
@@ -2148,7 +2156,9 @@ def _calculate_employee(emp, from_date, to_date, days_in_period,
 	tada_amount = 0.0
 	tada_days = 0.0
 	if is_worker_field_site:
-		tada_days = len(present_dates)
+		# Forced Leave days are paid as salary only: no TA/DA for a day the
+		# employee was sent home.
+		tada_days = len(present_dates - att.get("forced_leave_dates", set()))
 		tada_amount = flt(emp.get("daily_tada")) * tada_days
 	hra = conv = tel = 0.0
 	if not is_worker_field_site:

@@ -281,6 +281,7 @@ fixtures = [
         "filters": [["name", "in", [
             "Employee-no_validation",
             "Employee-no_validation_base_salary",
+            "Employee-forced_leave",
             "Sales Order-external_sales_order"
         ]]],
     }
