@@ -1909,8 +1909,11 @@ def _calculate_employee(emp, from_date, to_date, days_in_period,
 	# that Absent must not be double-counted against the employee here.
 	#
 	# An Absent caused by a missing punch (checked in but forgot to check out, or
-	# the reverse) is NOT absent without info: the day is already unpaid because
-	# it is not in Days Worked, so counting it here too would cost two days.
+	# the reverse) is NOT absent without info.
+	#
+	# Col L is for information only: it is not deducted from Payable Days. Every
+	# absent day is already unpaid because it is not in Days Worked (one day per
+	# absence).
 	absent_on_qualifying_holiday = len(absent_no_punch_dates & qualifying_holiday_dates)
 	absent_count = len(absent_no_punch_dates) - absent_on_qualifying_holiday
 
@@ -1933,7 +1936,8 @@ def _calculate_employee(emp, from_date, to_date, days_in_period,
 	# Absent attendance are independent (approved leave -> "On Leave"; absent ->
 	# "Absent"); netting the two counts would wrongly forfeit a paid leave day
 	# the employee has CL/AL balance for whenever they also have absences in the
-	# same month. Col L is still deducted on its own in the payable_days formula.
+	# same month. (Col L is not deducted in payable_days either: the absent day
+	# is simply not in Days Worked, so it costs one day.)
 	cl_balance = flt(cl_balance)
 	cl_generated = flt(cl_generated)
 
@@ -2000,7 +2004,13 @@ def _calculate_employee(emp, from_date, to_date, days_in_period,
 
 	# ---- Col Q: Payable Days -------------------------------------------------
 	# Per observation #23 do NOT clamp negative values.
-	payable_days = days_worked - late_deduction - absent_count + adj_cl + adj_al
+	#
+	# Col L (absent without information) is NOT subtracted (client decision,
+	# 2026-11-16): an absent day is already missing from Days Worked (Col H),
+	# so it costs one day's pay. Subtracting L as well charged two days per
+	# absence and drove 30 employees' payable days negative in October 2026.
+	# Col L stays on the sheet for information.
+	payable_days = days_worked - late_deduction + adj_cl + adj_al
 
 	# Dummy-employee override: when this employee is set as another
 	# Employee's ``dummy_employee``, Col Q is taken from the parent.
@@ -2646,7 +2656,9 @@ def get_calculation_trace(doc, employee):
 				         xh=_f(row.get("extra_late_half_days", 0)))),
 				("(L) Absent w/o info",
 				 "{0}  —  Absent with no check-in / check-out (excl. false) − qualifying "
-				 "holidays on those days ({1}). A missing-punch Absent is not counted".format(
+				 "holidays on those days ({1}). A missing-punch Absent is not counted. "
+				 "For information only: not deducted from Q, as an absent day is already "
+				 "not in H (one day per absence)".format(
 				     row["absent_no_info_days"], row.get("absent_on_qualifying_holiday", 0))),
 				("(M) Adjusted from CL",
 				 "0.00  —  {0} staff: CL is kept for year-end encashment, never adjusted "
@@ -2689,10 +2701,11 @@ def get_calculation_trace(doc, employee):
 				 "{0}  —  {1}".format(_f(row["payable_days"]),
 				                       "TAKEN FROM PARENT employee {0} (this employee is set as that employee's dummy_employee)".format(parent_id)
 				                       if parent_id else
-				                       "H({0}) − K({1}) − L({2}) + M({3}) + N({4})   (can be negative)"
+				                       "H({0}) − K({1}) + M({2}) + N({3})   (L {4} not deducted: absent days are already not in H)"
 				                       .format(_f(row["days_worked"]),
-				                               _f(row["late_deduction_days"]), row["absent_no_info_days"],
-				                               _f(row["adjusted_from_cl"]), _f(row["adjusted_from_al"])))),
+				                               _f(row["late_deduction_days"]),
+				                               _f(row["adjusted_from_cl"]), _f(row["adjusted_from_al"]),
+				                               row["absent_no_info_days"]))),
 				("(R) Salary Amount",
 				 "{0} = (Gross {1} / {2} days-in-month) × Q {3}"
 				 .format(_f(row["salary_amount"]), _f(emp.get("gross_salary")),
