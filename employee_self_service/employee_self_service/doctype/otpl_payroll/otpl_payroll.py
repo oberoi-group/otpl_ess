@@ -183,6 +183,7 @@ class OTPLPayroll(Document):
 
 		self.days_in_period = (getdate(self.to_date) - getdate(self.from_date)).days + 1
 		self.title = _("Payroll {0} to {1}").format(self.from_date, self.to_date)
+		self.validate_employees_active()
 
 		# Whenever the user (or the engine) edits rows manually, refresh the
 		# net columns and the summary totals so the UI stays consistent with
@@ -192,6 +193,101 @@ class OTPLPayroll(Document):
 
 		_set_totals(self)
 		_sync_order_allocations(self)
+
+	def validate_employees_active(self):
+		"""Only Active employees may be on the payroll.
+
+		Get Employees and Calculate Salary already fetch Active staff only;
+		this catches a row added by hand, an older draft, or an employee set
+		to Left after being fetched.
+		"""
+		emp_ids = list({r.employee for r in self.employees if r.employee})
+		if not emp_ids:
+			return
+		inactive = frappe.db.sql(
+			"""SELECT name, employee_name, status FROM `tabEmployee`
+			   WHERE name IN %s AND IFNULL(status, '') != 'Active'
+			   ORDER BY name""",
+			(tuple(emp_ids),), as_dict=True)
+		if inactive:
+			frappe.throw(
+				_("These employees are not Active. Remove them from the table, or set "
+				  "them Active on the Employee master:")
+				+ "<br>" + "<br>".join(
+					"• {0} ({1}): {2}".format(e.name, e.employee_name or "", e.status or "-")
+					for e in inactive),
+				title=_("Inactive Employees"))
+
+	def before_submit(self):
+		# Runs before on_submit on purpose: _persist_leave_balances commits
+		# mid-submit, so a refusal raised there would leave the payroll
+		# submitted with nothing booked.
+		self.validate_rows_bookable()
+
+	def validate_rows_bookable(self):
+		"""Refuse to submit until every employee on the payroll is complete.
+
+		All three are listed together so HR can fix them in one pass:
+		* No business line - create_salary_entries would skip them silently, no
+		  voucher and no payment request (Oct 2026: four employees, Rs 57,856).
+		* No mobile number on the Employee master - needed for the salary slip.
+		* Zero gross but days worked - a real person who would be paid nothing.
+		* An external sales order (Sales Order Pull) used by an employee or their
+		  check-ins that no Tranz Rail Sales Order links to - those days would be
+		  costed to the dummy order.
+		  Zero gross with no days worked is only reported after submit
+		  (_zero_gross_warning): such rows book nothing.
+		"""
+		rows = [r for r in self.employees if r.employee]
+		if not rows:
+			return
+		master = {
+			e.name: e for e in frappe.get_all(
+				"Employee", filters={"name": ["in", list({r.employee for r in rows})]},
+				fields=["name", "cell_number"])
+		}
+		master_line = {
+			r[0]: r[1] for r in frappe.db.sql(
+				"SELECT e.name, {0} FROM `tabEmployee` e WHERE e.name IN %s".format(
+					_business_line_sql()),
+				(tuple({r.employee for r in rows}),))
+		}
+
+		no_line, no_mobile, zero_gross = [], [], []
+		for r in rows:
+			label = "{0} ({1})".format(r.employee, (r.employee_name or "").strip())
+			if not r.business_line:
+				no_line.append(label + (
+					_(" - now set on the Employee master, run Calculate Salary again")
+					if master_line.get(r.employee) else ""))
+			if not ((master.get(r.employee) or {}).get("cell_number") or "").strip():
+				no_mobile.append(label)
+			if flt(r.gross_salary) <= 0 and flt(r.days_worked) > 0:
+				zero_gross.append(_("{0}: worked {1} days").format(label, flt(r.days_worked)))
+
+		# External (Oberoi Thermit) orders with no Tranz Rail Sales Order linked:
+		# their days would silently fall to the default (dummy) order.
+		no_link = [
+			_("{0} - used by {1}").format(ext, ", ".join(sorted(emps)))
+			for ext, emps in sorted(_unlinked_external_orders(
+				[r.employee for r in rows], getdate(self.from_date), getdate(self.to_date)).items())
+		]
+
+		problems = []
+		for heading, names in (
+				(_("External sales order not linked to any Sales Order. Open the Tranz Rail "
+				   "Sales Order for that job, set its External Sales Order, then Calculate "
+				   "Salary again:"), no_link),
+				(_("Business line not defined for these employees:"), no_line),
+				(_("Mobile number not defined on the Employee master for these employees:"), no_mobile),
+				(_("Gross salary is zero but these employees worked days, so they would be "
+				   "paid nothing. Set the gross salary on the Employee master, then Calculate "
+				   "Salary again:"), zero_gross)):
+			if names:
+				problems.append("<b>{0}</b><br>{1}".format(
+					heading, "<br>".join("• " + n for n in names)))
+		if problems:
+			frappe.throw("<br><br>".join(problems), title=_("Payroll Cannot Be Submitted"))
 
 	def on_submit(self):
 		"""Persist the closing AL/CL into OTPL Employee Leave Balance so it
@@ -270,6 +366,62 @@ def _business_line_sql():
 	return "COALESCE({0})".format(", ".join(terms))
 
 
+def _external_orders_linked():
+	"""True once Sales Order carries the External Sales Order link field."""
+	return (frappe.db.has_column("Sales Order", "external_sales_order")
+	        and frappe.db.has_column("Employee", "external_order"))
+
+
+def _employee_sales_order_sql():
+	"""SQL for an employee's default sales order (alias ``e``).
+
+	An external employee (Employee.external_sales_order ticked) works an
+	Oberoi Thermit order held in Employee.external_order, a Sales Order Pull.
+	That is not a Tranz Rail Sales Order, so it is resolved to the Tranz Rail
+	Sales Order whose External Sales Order field points at it. Orders are never
+	matched by number: the same number can be a different job in each company.
+	"""
+	if not _external_orders_linked():
+		return "e.sales_order"
+	return """CASE WHEN IFNULL(e.external_sales_order, 0) = 1
+		THEN (SELECT so.name FROM `tabSales Order` so
+		      WHERE so.external_sales_order = e.external_order
+		        AND IFNULL(e.external_order, '') != '' AND so.docstatus < 2
+		      ORDER BY so.docstatus DESC, so.modified DESC LIMIT 1)
+		ELSE e.sales_order END"""
+
+
+def _external_order_map(external_orders):
+	"""{Sales Order Pull name: Tranz Rail Sales Order} via the External Sales
+	Order field. External orders with no linked Sales Order are absent."""
+	external_orders = [x for x in set(external_orders) if x]
+	if not external_orders or not _external_orders_linked():
+		return {}
+	rows = frappe.db.sql(
+		"""SELECT external_sales_order, name FROM `tabSales Order`
+		   WHERE external_sales_order IN %s AND docstatus < 2
+		   ORDER BY docstatus, modified""",
+		(tuple(external_orders),))
+	return {ext: so for ext, so in rows}  # later (submitted, newest) wins
+
+
+def _unlinked_external_orders(emp_ids, from_date, to_date):
+	"""{external order: set(employees)} for external orders the payroll would
+	use but that no Tranz Rail Sales Order is linked to - from the employee's
+	own external order and from their IN check-ins in the period."""
+	out = defaultdict(set)
+	if not emp_ids or not _external_orders_linked():
+		return out
+	_fetch_order_days(emp_ids, from_date, to_date, unlinked=out)
+	for emp, ext in frappe.db.sql(
+			"""SELECT name, external_order FROM `tabEmployee`
+			   WHERE name IN %s AND IFNULL(external_sales_order, 0) = 1
+			     AND IFNULL(external_order, '') != ''""", (tuple(emp_ids),)):
+		if ext not in _external_order_map([ext]):
+			out[ext].add(emp)
+	return out
+
+
 def _select_employees(where_sql, where_values):
 	"""Internal helper: run the canonical employee SELECT used by payroll
 	calculation. ``where_sql`` is appended after ``e.status='Active'``-style
@@ -286,7 +438,7 @@ def _select_employees(where_sql, where_values):
 			e.department                        AS department,
 			e.staff_type                        AS staff_type,
 			e.location                          AS location,
-			e.sales_order                       AS sales_order,
+			{sales_order_expr}                  AS sales_order,
 			e.uan_no                            AS uan_no,
 			e.esi_number                        AS esic_no,
 			e.advance_to_be_deducted            AS gross_salary,
@@ -333,6 +485,7 @@ def _select_employees(where_sql, where_values):
 			tel_expr="COALESCE(e.telephone_amount, 0)" if frappe.db.has_column("Employee", "telephone_amount") else "0",
 			dummy_expr=dummy_expr,
 			business_line_expr=business_line_expr,
+			sales_order_expr=_employee_sales_order_sql(),
 		),
 		where_values,
 		as_dict=True,
@@ -546,8 +699,13 @@ def calculate_payroll(doc):
 
 	# Sales-order wise split of each row's payable days / salary, driven by
 	# the order stamped on each day's Employee Checkin.
-	order_days_map = _fetch_order_days(emp_ids, from_date, to_date)
+	unlinked = defaultdict(set)
+	order_days_map = _fetch_order_days(emp_ids, from_date, to_date, unlinked=unlinked)
 	allocations = _build_order_allocations(rows, order_days_map, log_lines)
+	for ext, emps in sorted(unlinked.items()):
+		log_lines.append(
+			"External sales order {0} is not linked to any Sales Order (set External "
+			"Sales Order on the Sales Order): {1}".format(ext, ", ".join(sorted(emps))))
 
 	return {"rows": rows, "log": log_lines, "allocations": allocations}
 
@@ -1242,9 +1400,9 @@ def _fetch_payroll_payable_balance(emp_ids, to_date):
 	"""Party balance on the configured Payroll Payable account per employee as
 	of ``to_date``. Used for Col AD (expenses).
 
-	Payroll Payable is a credit (liability) account, so we negate the
-	``get_balance_on`` debit-minus-credit result to express it as a positive
-	outstanding balance.
+	The ``get_balance_on`` result is returned as is (debit minus credit), so a
+	NEGATIVE figure means the company owes the employee and a positive one
+	means the employee owes the company. Col AD relies on that sign.
 	"""
 	out = {e: 0.0 for e in emp_ids}
 	if not emp_ids:
@@ -1307,7 +1465,7 @@ def _fetch_al_eligible_business_lines():
 MAX_ORDER_SLOTS = 10
 
 
-def _fetch_order_days(emp_ids, from_date, to_date):
+def _fetch_order_days(emp_ids, from_date, to_date, unlinked=None):
 	"""Return {employee: {sales_order: worked_days}} for the period.
 
 	The per-day sales order lives on Employee Checkin (`order`), which is
@@ -1315,29 +1473,50 @@ def _fetch_order_days(emp_ids, from_date, to_date):
 	employee punched several times, and a date split across two orders
 	contributes half a day to each so the per-employee total still equals
 	the number of distinct days actually worked.
+
+	An external employee's IN punch has no `order`; its Oberoi Thermit order
+	sits in the text field `sales_order` as a Sales Order Pull name. That is
+	resolved to the Tranz Rail Sales Order linked to it through the External
+	Sales Order field. When none is linked the day counts for no order and,
+	if ``unlinked`` (a defaultdict(set)) is given, is recorded there as
+	{external order: employees}.
 	"""
 	if not emp_ids:
 		return {}
 	if not frappe.db.has_column("Employee Checkin", "order"):
 		return {}
 
+	use_external = _external_orders_linked() and frappe.db.has_column("Employee Checkin", "sales_order")
 	rows = frappe.db.sql(
 		"""
-		SELECT employee, DATE(time) AS att_date, `order` AS sales_order
+		SELECT employee, DATE(time) AS att_date, `order` AS sales_order, {ext} AS external_order
 		FROM `tabEmployee Checkin`
 		WHERE employee IN %(ids)s
 		  AND DATE(time) BETWEEN %(from_date)s AND %(to_date)s
-		  AND IFNULL(`order`, '') != ''
-		GROUP BY employee, DATE(time), `order`
-		""",
+		  AND (IFNULL(`order`, '') != '' {ext_cond})
+		GROUP BY employee, DATE(time), `order`, external_order
+		""".format(
+			ext="IF(IFNULL(`order`, '') = '' AND log_type = 'IN', sales_order, NULL)" if use_external else "NULL",
+			ext_cond=("OR (log_type = 'IN' AND sales_order IN (SELECT name FROM `tabSales Order Pull`))"
+			          if use_external else ""),
+		),
 		{"ids": tuple(emp_ids), "from_date": from_date, "to_date": to_date},
 		as_dict=True,
 	)
+	ext_map = _external_order_map(r.external_order for r in rows if not r.sales_order)
 
 	# employee -> date -> set(orders), so a day shared by two orders splits.
 	by_emp_date = defaultdict(lambda: defaultdict(set))
 	for r in rows:
-		by_emp_date[r.employee][r.att_date].add(r.sales_order)
+		so = r.sales_order
+		if not so and r.external_order:
+			so = ext_map.get(r.external_order)
+			if not so:
+				if unlinked is not None:
+					unlinked[r.external_order].add(r.employee)
+				continue
+		if so:
+			by_emp_date[r.employee][r.att_date].add(so)
 
 	out = {}
 	for emp, dates in by_emp_date.items():
@@ -1943,15 +2122,17 @@ def _calculate_employee(emp, from_date, to_date, days_in_period,
 	)
 
 	# ---- Col AD: Expenses balance (observation #16) --------------------------
-	# Payroll Payable ledger balance as of period end, netted against AB
-	# (part-advance transfers within the period are already captured in AB).
-	#   * balance >= 0  ->  AD = balance - AB
-	#   * balance <  0  ->  AD = balance + AB
+	# Payroll Payable ledger balance as of period end (debit - credit, so
+	# negative = the company owes the employee), with the part advance taken
+	# back out: the part-advance voucher already debits this same payable, and
+	# AC deducts AB on its own, so leaving it in AD would deduct it twice.
+	#   AD = balance - AB, whatever the sign of the balance.
+	# The old rule added AB back when the balance was negative, which read the
+	# raw debit-minus-credit figure as if it were a positive liability and
+	# took the part advance off twice for anyone owed money (Oct 2026:
+	# TRIYOGI understated by 2 x 5,000; the payment request was right).
 	pp_balance = flt(payable_balance)
-	if pp_balance >= 0:
-		expenses_balance = pp_balance - part_adv
-	else:
-		expenses_balance = pp_balance + part_adv
+	expenses_balance = pp_balance - part_adv
 
 	# ---- Col AE: Extra Allowance (observations #19, #20) ---------------------
 	# TADA  -> only Worker/Site or Field/Site, daily_tada × days marked Present
@@ -2551,9 +2732,8 @@ def get_calculation_trace(doc, employee):
 				 .format(_f(part_adv), get_last_day(from_date))),
 				("(AC) Net Payable", "{0} = U − V − W − X − AA − AB".format(_f(row["net_amount_payable"]))),
 				("(AD) Expenses (Payroll Payable balance)",
-				 "{0} = payroll-payable balance as on {1} {2} AB (balance ≥ 0 ⇒ − AB; balance < 0 ⇒ + AB)"
-				 .format(_f(row["expenses_balance"]), to_date,
-				         "−" if flt(payable_balance) >= 0 else "+")),
+				 "{0} = payroll-payable balance as on {1} ({2}, debit − credit) − AB"
+				 .format(_f(row["expenses_balance"]), to_date, _f(payable_balance))),
 				("(AE) Extra Allowance",
 				 "{0} = TADA {1} + HRA {2} + Conv {3} + Tel {4}  "
 				 "[HRA {5} and Conv {6} monthly × Q / {7}, bounded 0–100%]"
@@ -2851,8 +3031,17 @@ def create_salary_entries(payroll):
 		log.append(_("Booked to the default sales order (no attendance order, no "
 		             "Employee master order): {0}").format(", ".join(fallback_used)))
 
+	# Nothing below changes what was booked; it makes gaps visible instead of
+	# leaving them to be found at payment time.
+	warnings = (_request_coverage_gaps(doc, posting_date) + _unposted_tds_warning(doc)
+	            + _zero_gross_warning(doc))
+	log.extend(warnings)
+
 	doc.db_set("salary_entries_created", 1)
 	doc.db_set("employee_salary_entries", "\n".join(log))
+	if warnings:
+		frappe.msgprint("<br><br>".join(warnings), title=_("Check Before Paying"),
+		                indicator="orange")
 
 	return {
 		"created": created,
@@ -3545,6 +3734,100 @@ def _create_salary_payable_requests(doc, verticals, posting_date):
 			message=frappe.get_traceback(),
 		)
 		return made, _("see Error Log")
+
+
+def _request_coverage_gaps(doc, posting_date):
+	"""Employees the payroll booked who are in none of its payment requests.
+
+	A request with no rows is never saved, and a request leaves out anyone
+	already on another submitted request for the same date (the double-payment
+	guard in Salary Payable Request.get_exclude_employee). Both are correct,
+	but silent: in Oct 2026 a whole vertical's request came out empty and its
+	employee went unpaid until the salary check found it.
+	"""
+	booked = {
+		r.employee: r.business_line for r in doc.employees
+		if r.employee and r.business_line and (
+			flt(r.total_salary_due, 2) > 0
+			or flt(getattr(r, "extra_allowance", 0) or 0, 2) > 0)
+	}
+	if not booked:
+		return []
+
+	covered = {
+		r[0] for r in frappe.db.sql(
+			"""SELECT d.employee
+			   FROM `tabSalary Payable Request Details` d
+			   INNER JOIN `tabSalary Payable Request` p ON p.name = d.parent
+			   WHERE p.otpl_payroll = %s AND p.docstatus < 2""",
+			doc.name)
+	}
+	missing = sorted(set(booked) - covered)
+	# The request raised for each vertical, so a row taken off one by hand
+	# (Oct 2026: three employees removed from SPR00062 / SPR00067) is named
+	# as such rather than reported as "no request raised".
+	request_for = {}
+	for r in frappe.get_all("Salary Payable Request",
+	                        {"otpl_payroll": doc.name, "docstatus": ["<", 2]},
+	                        ["name", "business_vertical"]):
+		request_for.setdefault(r.business_vertical, []).append(r.name)
+	if not missing:
+		return []
+
+	elsewhere = {}
+	for r in frappe.db.sql(
+			"""SELECT d.employee, p.name
+			   FROM `tabSalary Payable Request Details` d
+			   INNER JOIN `tabSalary Payable Request` p ON p.name = d.parent
+			   WHERE p.docstatus = 1 AND p.date_till_salary_to_calculate = %s
+			     AND IFNULL(p.otpl_payroll, '') != %s AND d.employee IN %s""",
+			(posting_date, doc.name, tuple(missing))):
+		elsewhere.setdefault(r[0], []).append(r[1])
+
+	lines = []
+	for emp in missing:
+		if emp in elsewhere:
+			reason = _("already on submitted request {0}").format(", ".join(elsewhere[emp]))
+		elif booked[emp] in request_for:
+			reason = _("not on {0}, the request for {1}: removed from it?").format(
+				", ".join(request_for[booked[emp]]), booked[emp])
+		else:
+			reason = _("no request raised for {0}").format(booked[emp])
+		lines.append("{0} ({1})".format(emp, reason))
+	return [_("Booked but in no Salary Payable Request of this payroll - pay or "
+	          "confirm by hand: {0}").format(", ".join(lines))]
+
+
+def _unposted_tds_warning(doc):
+	"""TDS the payroll deducted in its own figures but nobody has posted yet.
+
+	TDS posting stays manual by the client's rule (Process TDS Entry, or a
+	voucher keyed by hand), so this only reports. Until it is posted the
+	payment requests, which read the ledger, pay the TDS out to the employee.
+	"""
+	with_tds = ["{0} ({1})".format(r.employee, flt(r.tds, 2))
+	            for r in doc.employees if r.employee and flt(r.tds, 2) > 0]
+	if not with_tds:
+		return []
+	return [_("TDS is deducted on this payroll but not posted yet: {0}. Run Process "
+	          "TDS Entry (or post it by hand), then Refresh from Ledger on the requests, "
+	          "before paying.").format(", ".join(with_tds))]
+
+
+def _zero_gross_warning(doc):
+	"""Rows with no gross salary and no days worked: nothing is booked for them,
+	so they are only reported - likely test or old records.
+
+	Zero gross WITH days worked never gets here: validate_rows_bookable refuses
+	the submit for those.
+	"""
+	idle = [r.employee for r in doc.employees
+	        if r.employee and flt(r.gross_salary) <= 0 and flt(r.days_worked) <= 0
+	        and flt(getattr(r, "extra_allowance", 0) or 0, 2) <= 0]
+	if not idle:
+		return []
+	return [_("Zero gross and no attendance (test or old record? mark inactive): "
+	          "{0}").format(", ".join(idle))]
 
 
 @frappe.whitelist()

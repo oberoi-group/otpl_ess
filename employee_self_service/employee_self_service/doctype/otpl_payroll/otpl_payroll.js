@@ -2,6 +2,15 @@
 // For license information, please see license.txt
 
 frappe.ui.form.on('OTPL Payroll', {
+	setup(frm) {
+		// Only Active employees can be picked by hand, the same rule Get
+		// Employees and Calculate Salary already apply; validate() refuses
+		// any row that slips through (typed in, or made inactive later).
+		const active_only = () => ({ filters: { status: 'Active' } });
+		frm.set_query('employee', active_only);
+		frm.set_query('employee', 'employees', active_only);
+	},
+
 	refresh(frm) {
 		if (frm.doc.docstatus === 0) {
 			frm.add_custom_button(__('Get Employees'), () => fetch_employees(frm));
