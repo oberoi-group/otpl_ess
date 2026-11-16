@@ -533,3 +533,34 @@ def validate(doc,method):
                 )
             )
     fetch_employee_details(doc)
+    validate_site_checkin_has_order(doc)
+
+
+def validate_site_checkin_has_order(doc):
+    """Refuse a Site employee's check-in when no sales order is allocated.
+
+    Client rule (2026-11-16): without an order the day's salary cannot be
+    costed to a job and falls to the dummy order, so the app must stop the
+    check-in and say an order has to be allocated. Only Site staff, only a new
+    IN punch (check-out is never blocked). An order is either the Tranz Rail
+    sales order or the external (Oberoi Thermit) order that
+    fetch_employee_details has just put on the punch. Travelling employees
+    and auto-created entries are left alone - travelling staff may report to a
+    manager with no order on purpose.
+    """
+    if not doc.is_new() or doc.log_type != "IN" or doc.get("auto_created_entry"):
+        return
+    if doc.get("employee_location") != "Site":
+        return
+    if doc.get("order") or doc.get("sales_order"):
+        return
+    if doc.get("checkin_type") == "Travelling":
+        return
+    from employee_self_service.employee_self_service.doctype.travel_request.travel_request import (
+        is_employee_travelling,
+    )
+    if is_employee_travelling(doc.employee):
+        return
+    frappe.throw(_("Order no. has not been allocated to you. An order no. has to be allocated "
+                   "before you can check in. Please contact your team leader or administrator."),
+                 title=_("Order Not Allocated"))
