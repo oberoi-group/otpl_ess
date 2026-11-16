@@ -11,7 +11,12 @@ frappe.ui.form.on('OTPL Payroll', {
 		frm.set_query('employee', 'employees', active_only);
 	},
 
+	onload_post_render(frm) {
+		otpl_lock_row_delete(frm, 'employees');
+	},
+
 	refresh(frm) {
+		otpl_lock_row_delete(frm, 'employees');
 		if (frm.doc.docstatus === 0) {
 			frm.add_custom_button(__('Get Employees'), () => fetch_employees(frm));
 			frm.add_custom_button(__('Calculate Salary'), () => calculate_salary(frm))
@@ -86,6 +91,21 @@ frappe.ui.form.on('OTPL Payroll', {
 	get_employees: fetch_employees,
 	calculate_payroll: calculate_salary,
 });
+
+// Employees cannot be removed from the payroll (client rule). Frappe v12 has
+// no "cannot delete rows" option, so the grid is tagged and its two delete
+// buttons (bulk Delete, and Delete inside an opened row) are hidden by CSS.
+// The server refuses a save with a missing employee in any case.
+function otpl_lock_row_delete(frm, table) {
+	const field = frm.fields_dict[table];
+	if (!field || !field.grid) return;
+	field.grid.wrapper.addClass('otpl-no-row-delete');
+	if (!document.getElementById('otpl-no-row-delete-style')) {
+		$('<style id="otpl-no-row-delete-style">'
+			+ '.otpl-no-row-delete .grid-remove-rows, .otpl-no-row-delete .grid-delete-row'
+			+ ' { display: none !important; }</style>').appendTo('head');
+	}
+}
 
 function refresh_days(frm) {
 	if (frm.doc.from_date && frm.doc.to_date) {

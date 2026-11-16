@@ -184,6 +184,7 @@ class OTPLPayroll(Document):
 		self.days_in_period = (getdate(self.to_date) - getdate(self.from_date)).days + 1
 		self.title = _("Payroll {0} to {1}").format(self.from_date, self.to_date)
 		self.validate_employees_active()
+		self.validate_all_active_employees_present()
 
 		# Whenever the user (or the engine) edits rows manually, refresh the
 		# net columns and the summary totals so the UI stays consistent with
@@ -194,6 +195,40 @@ class OTPLPayroll(Document):
 		_set_totals(self)
 		_sync_order_allocations(self)
 
+	def validate_all_active_employees_present(self):
+		"""Every Active employee matching this payroll's filters must be on it.
+
+		Client rule (2026-11-16): no employee may be left off or deleted from the
+		payroll. The filters (Company, Staff Type, Location, Business Line,
+		Employee) stay usable, so "all" means all Active employees matching them -
+		the same set Get Employees and Calculate Salary fetch. A new payroll with
+		no rows yet is not checked; once the table is filled, removing anyone is
+		refused on save and on submit. Inactive employees are not expected here
+		(validate_employees_active refuses them).
+		"""
+		present = {r.employee for r in (self.get("employees") or []) if r.employee}
+		if not present and self.docstatus == 0 and (
+				self.is_new() or not frappe.db.exists("OTPL Payroll Detail", {"parent": self.name})):
+			# A draft that has never been filled - nothing to protect yet.
+			return
+		filters = _build_employee_filter(frappe._dict(
+			{k: self.get(k) for k in ("company", "staff_type", "location", "business_line", "employee")}))
+		expected = {
+			r[0] for r in frappe.db.sql(
+				"SELECT e.name FROM `tabEmployee` e WHERE {0}".format(filters["sql"]),
+				filters["values"])
+		}
+		missing = sorted(expected - present)
+		if missing:
+			names = dict(frappe.db.sql(
+				"SELECT name, employee_name FROM `tabEmployee` WHERE name IN %s", (tuple(missing),)))
+			frappe.throw(
+				_("Every active employee must be on the payroll; employees cannot be removed. "
+				  "These active employees are missing - press Calculate Salary again to bring "
+				  "them back (or set them Left on the Employee master if they have left):")
+				+ "<br>" + "<br>".join("• {0} ({1})".format(e, (names.get(e) or "").strip()) for e in missing),
+				title=_("Employees Missing From Payroll"))
+
 	def validate_employees_active(self):
 		"""Only Active employees may be on the payroll.
 
@@ -201,7 +236,7 @@ class OTPLPayroll(Document):
 		this catches a row added by hand, an older draft, or an employee set
 		to Left after being fetched.
 		"""
-		emp_ids = list({r.employee for r in self.employees if r.employee})
+		emp_ids = list({r.employee for r in (self.get("employees") or []) if r.employee})
 		if not emp_ids:
 			return
 		inactive = frappe.db.sql(
@@ -211,8 +246,8 @@ class OTPLPayroll(Document):
 			(tuple(emp_ids),), as_dict=True)
 		if inactive:
 			frappe.throw(
-				_("These employees are not Active. Remove them from the table, or set "
-				  "them Active on the Employee master:")
+				_("These employees are not Active. Press Calculate Salary again (it only "
+				  "picks Active employees), or set them Active on the Employee master:")
 				+ "<br>" + "<br>".join(
 					"• {0} ({1}): {2}".format(e.name, e.employee_name or "", e.status or "-")
 					for e in inactive),
@@ -238,7 +273,7 @@ class OTPLPayroll(Document):
 		  Zero gross with no days worked is only reported after submit
 		  (_zero_gross_warning): such rows book nothing.
 		"""
-		rows = [r for r in self.employees if r.employee]
+		rows = [r for r in (self.get("employees") or []) if r.employee]
 		if not rows:
 			return
 		master = {
