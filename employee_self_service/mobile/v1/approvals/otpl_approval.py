@@ -160,12 +160,28 @@ def approve_otpl_leave():
             from frappe.utils import date_diff
             approved_days = date_diff(approved_to_date, approved_from_date) + 1
 
-            # Update Leave Pull
-            leave_doc.status = "Approved"
-            leave_doc.approved_from_date = approved_from_date
-            leave_doc.approved_to_date = approved_to_date
-            leave_doc.total_no_of_approved_days = approved_days
-            leave_doc.save(ignore_permissions=True)
+            # Update Leave Pull. Its on_update pushes the approval to the source
+            # ERP, which creates the Leave Applications there; if the source
+            # refuses (overlap, balance, attendance...) the save raises with the
+            # source's reason. Roll back so the Leave Pull stays Pending, and show
+            # the approver that reason rather than a generic error.
+            try:
+                leave_doc.status = "Approved"
+                leave_doc.approved_from_date = approved_from_date
+                leave_doc.approved_to_date = approved_to_date
+                leave_doc.total_no_of_approved_days = approved_days
+                leave_doc.save(ignore_permissions=True)
+            except Exception as save_error:
+                frappe.db.rollback()
+                frappe.log_error(
+                    title="Leave Pull Approval Failed",
+                    message=frappe.get_traceback(),
+                )
+                return gen_response(
+                    500,
+                    frappe.utils.strip_html(str(save_error))
+                    or "Could not approve the leave application. Please contact HR.",
+                )
 
             return gen_response(200, "Leave application approved successfully")
 

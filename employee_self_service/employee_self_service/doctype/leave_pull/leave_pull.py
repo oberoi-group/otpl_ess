@@ -61,8 +61,10 @@ def approve_leave(docname, approved_from_date, approved_to_date):
 		return {"success": True, "message": "Leave approved successfully"}
 		
 	except Exception as e:
+		# Keep the Leave Pull Pending: undo the half-done save before logging.
+		frappe.db.rollback()
 		frappe.log_error(
 			message=frappe.get_traceback(),
 			title="Error approving leave pull"
 		)
-		frappe.throw(_("Error approving leave: {0}").format(str(e)))
+		frappe.throw(_("Error approving leave: {0}").format(frappe.utils.strip_html(str(e))))

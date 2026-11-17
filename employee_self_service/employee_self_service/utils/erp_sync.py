@@ -375,16 +375,29 @@ def receive_leave_status_update(data, source_site=None):
 		
 		doc.flags.ignore_sync = True  # Prevent re-syncing back
 		doc.save(ignore_permissions=True)
-		
+
 		frappe.db.commit()
 		return {"success": True, "message": "Leave status updated successfully"}
-		
+
 	except Exception as e:
+		# The save writes status = Approved BEFORE on_update creates the Leave
+		# Applications. If that creation fails (overlap, balance, attendance...),
+		# the exception is caught here and the request ends normally, so Frappe
+		# would commit the half-done save: an OTPL Leave left "Approved" with no
+		# Leave Application. Roll back so the leave stays Pending, and hand the
+		# reason back so the approver's ERP can refuse the approval with it.
+		frappe.db.rollback()
 		frappe.log_error(
 			message=frappe.get_traceback(),
 			title="Error receiving Leave status update"
 		)
-		return {"success": False, "message": str(e)}
+		return {"success": False, "message": _clean_error_message(e)}
+
+
+def _clean_error_message(error):
+	"""Plain-text form of an exception message (ERPNext errors carry HTML links)."""
+	from frappe.utils import strip_html
+	return strip_html(str(error) or "").strip() or error.__class__.__name__
 
 
 @frappe.whitelist()
@@ -1581,69 +1594,103 @@ def push_leave_status_to_source(leave_pull_doc):
 	"""
 	Push Leave Pull status update back to source ERP's OTPL Leave
 	Called from Leave Pull on_update hook
+
+	The source ERP is where the OTPL Leave lives and where approving it creates
+	the Leave Applications. If the source refuses the update (e.g. the Leave
+	Application overlaps an existing one), this raises with the source's reason,
+	so the Leave Pull approval fails too: it stays Pending on both sides and the
+	approver sees why, instead of a leave silently marked Approved with no Leave
+	Application behind it.
 	"""
-	try:
-		# Check if this record came from an external source
-		if not leave_pull_doc.source_erp:
-			return
-		
-		# Prevent infinite sync loop
-		if hasattr(leave_pull_doc, 'flags') and leave_pull_doc.flags.get('ignore_sync'):
-			return
-		
-		# Find the ERP Sync Settings for the source ERP
-		sync_settings = frappe.get_all(
-			"ERP Sync Settings",
-			filters={"enabled": 1, "erp_url": leave_pull_doc.source_erp},
-			fields=["name"],
-			limit=1
-		)
-		
-		if not sync_settings:
-			frappe.log_error(
-				"No ERP Sync Settings found for source ERP: {0}".format(leave_pull_doc.source_erp),
-				"Leave Status Sync Error"
-			)
-			return
-		
-		# Prepare status update data
-		status_data = {
-			"leave_id": leave_pull_doc.leave_id,
-			"status": leave_pull_doc.status,
-			"approved_from_date": str(leave_pull_doc.approved_from_date) if leave_pull_doc.approved_from_date else None,
-			"approved_to_date": str(leave_pull_doc.approved_to_date) if leave_pull_doc.approved_to_date else None,
-			"total_no_of_approved_days": leave_pull_doc.total_no_of_approved_days
-		}
-		
-		# Get sync settings
-		settings = frappe.get_doc("ERP Sync Settings", sync_settings[0].name)
-		
-		# Send status update directly (not queued for immediate update)
-		success = send_to_remote_erp(
-			settings.erp_url,
-			settings.get_password("api_key"),
-			settings.get_password("api_secret"),
-			"Leave Status Update",
-			status_data,
-			"Status Update"
-		)
-		
-		if success:
-			frappe.log_error(
-				message="Successfully synced Leave status for {0} to source ERP".format(leave_pull_doc.leave_id),
-				title="Leave Status Sync Success"
-			)
-		else:
-			frappe.log_error(
-				message="Failed to sync Leave status for {0} to source ERP".format(leave_pull_doc.leave_id),
-				title="Leave Status Sync Failed"
-			)
-		
-	except Exception as e:
+	# Check if this record came from an external source
+	if not leave_pull_doc.source_erp:
+		return
+
+	# Prevent infinite sync loop
+	if hasattr(leave_pull_doc, 'flags') and leave_pull_doc.flags.get('ignore_sync'):
+		return
+
+	# Find the ERP Sync Settings for the source ERP
+	sync_settings = frappe.get_all(
+		"ERP Sync Settings",
+		filters={"enabled": 1, "erp_url": leave_pull_doc.source_erp},
+		fields=["name"],
+		limit=1
+	)
+
+	if not sync_settings:
 		frappe.log_error(
-			message=frappe.get_traceback(),
-			title="Error syncing Leave status to source for {0}".format(leave_pull_doc.leave_id)
+			"No ERP Sync Settings found for source ERP: {0}".format(leave_pull_doc.source_erp),
+			"Leave Status Sync Error"
 		)
+		return
+
+	# Prepare status update data
+	status_data = {
+		"leave_id": leave_pull_doc.leave_id,
+		"status": leave_pull_doc.status,
+		"approved_from_date": str(leave_pull_doc.approved_from_date) if leave_pull_doc.approved_from_date else None,
+		"approved_to_date": str(leave_pull_doc.approved_to_date) if leave_pull_doc.approved_to_date else None,
+		"total_no_of_approved_days": leave_pull_doc.total_no_of_approved_days
+	}
+
+	settings = frappe.get_doc("ERP Sync Settings", sync_settings[0].name)
+
+	# Send status update directly (not queued) so the source's answer decides
+	# whether this approval goes through.
+	success, message = _send_leave_status_update(settings, status_data)
+
+	if not success:
+		frappe.log_error(
+			message="Failed to sync Leave status for {0} to source ERP: {1}".format(
+				leave_pull_doc.leave_id, message),
+			title="Leave Status Sync Failed"
+		)
+		frappe.throw(
+			_("Leave {0} could not be {1}. {2}").format(
+				leave_pull_doc.leave_id, (leave_pull_doc.status or "").lower(), message),
+			title=_("Leave Not {0}").format(leave_pull_doc.status)
+		)
+
+
+def _send_leave_status_update(settings, status_data):
+	"""POST a Leave Status Update to the source ERP.
+
+	Returns (success, message): message is the source's own reason on refusal
+	(e.g. the Leave Application overlap error), or a connection error.
+	"""
+	url = "{0}/api/method/employee_self_service.employee_self_service.utils.erp_sync.receive_leave_status_update".format(
+		settings.erp_url
+	)
+	headers = {
+		"Authorization": "token {0}:{1}".format(
+			settings.get_password("api_key"), settings.get_password("api_secret"))
+	}
+	payload = {
+		"data": json.dumps(status_data),
+		"source_site": frappe.utils.get_url()
+	}
+	try:
+		response = requests.post(url, headers=headers, data=payload, timeout=30)
+	except Exception:
+		frappe.log_error(message=frappe.get_traceback(), title="Error sending Leave status to source ERP")
+		return False, _("Could not reach the source ERP. Please try again later.")
+
+	if response.status_code != 200:
+		frappe.log_error(
+			message="Status Code: {0}\nResponse: {1}".format(response.status_code, response.text),
+			title="Remote ERP API Error - receive_leave_status_update"
+		)
+		return False, _("The source ERP returned an error (HTTP {0}). Please try again later.").format(
+			response.status_code)
+
+	try:
+		result = response.json().get("message") or {}
+	except Exception:
+		result = {}
+	if result.get("success"):
+		return True, result.get("message")
+	return False, result.get("message") or _("The source ERP rejected the update.")
 
 
 def push_expense_status_to_source(expense_pull_doc):
